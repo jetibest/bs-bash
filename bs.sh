@@ -82,10 +82,25 @@ parse_address()
 	echo "$__fn_addr_port"
 	echo "$__fn_addr_path"
 }
+
 pipe_linebuffer()
 {
     __fn_blocksize="${1:-16}"
     while IFS= read -r line;do len="${#line}"; len="$(( ($__fn_blocksize - (len + 1) % $__fn_blocksize) % $__fn_blocksize ))"; echo "$line"; printf "%${len}s" | tr ' ' '\0'; done
+}
+
+__fn_cleanup_array=()
+__rm_onexit_cb()
+{
+    for __fn_file in "${__fn_cleanup_array[@]}"
+    do
+        rm -f "$__fn_file"
+    done
+}
+trap '__rm_onexit_cb' EXIT
+rm_onexit()
+{
+    __fn_cleanup_array+=("$@")
 }
 
 # Exit on any error:
@@ -141,20 +156,95 @@ fi
 
 # Handle command:
 
-if [ "$1" = "add" ] || [ "$1" = "register" ] || [ "$1" = "deregister" ] # bs add <user@host> [host][:port]
+if [ "$1" = "remove" ] # bs remove <user@host>
+then
+    
+    { read -r addr_user; read -r addr_host; read -r addr_port; read -r addr_path; } < <(parse_address "$2")
+	
+	# Check usage
+	if [ -z "$addr_user" ] || [ -z "$addr_host" ]
+	then
+		echo "error: Invalid usage. Use: $0 remove [+w|-w] <user@host>" >&2
+		exit 1
+	fi
+	
+	contact="$addr_user@$addr_host"
+	
+	nothing_to_do=true
+	
+	# Move store to trash
+	if [ -e "$__bs_home/store/$contact" ]
+    then
+        if ! [ -e "$__bs_home/trash/store" ]
+        then
+            mkdir -p "$__bs_home/trash/store"
+            
+        elif [ -e "$__bs_home/trash/store/$contact" ]
+        then
+            echo "error: Duplicate trash entry, manual cleanup required: rm -rf $__bs_home/trash/store/$contact" >&2
+            exit 1
+        fi
+        
+        mv "$__bs_home/store/$contact" "$__bs_home/trash/store/$contact"
+        
+        echo "info: Existing store directory put in trash: trash/store/$contact"
+        
+        nothing_to_do=false
+    fi
+    
+    # Move contact to trash
+    if [ -e "$__bs_home/contacts/$contact" ]
+	then
+        if ! [ -e "$__bs_home/trash/contacts" ]
+        then
+            mkdir -p "$__bs_home/trash/contacts"
+            
+        elif [ -e "$__bs_home/trash/contacts/$contact" ]
+        then
+            echo "error: Duplicate trash entry, manual cleanup required: rm -rf $__bs_home/trash/contacts/$contact" >&2
+            exit 1
+        fi
+        
+        mv "$__bs_home/contacts/$contact" "$__bs_home/trash/contacts/$contact"
+        
+        echo "info: Existing contact directory put in trash: trash/contacts/$contact"
+        
+        nothing_to_do=false
+	fi
+	
+	if $nothing_to_do
+	then
+        echo "info: Nothing to do. Contact does not exist, or is already removed: $contact"
+	fi
+	
+
+elif [ "$1" = "add" ] # bs add +rw <user@host>
 then
 	# Add a contact by their public key (in stdin) and address
+	# This is a LOCAL register/add, it does not change anything at a remote server
 	
-	# TODO: connect to host, and send request to register at server, server may be open to any new contacts and/or users
-	# In this case, deregister is only allowed if local connection, or if authenticated through signature matching the contact signature
-	# Trash should be regularly deleted by server, using find and mtime +2, for any file >48h old
+    set_store=""
+	
+	while [ "${2:0:1}" = "+" ] || [ "${2:0:1}" = "-" ]
+	do
+        if [ "$2" == "--" ]
+        then
+            shift
+            break
+        fi
+        case "$2" in
+            +*w*) set_store="add"; ;;
+            -*w*) set_store="del"; ;;
+        esac
+        shift
+	done
 	
 	{ read -r addr_user; read -r addr_host; read -r addr_port; read -r addr_path; } < <(parse_address "$2")
 	
 	# Check usage
 	if [ -z "$addr_user" ] || [ -z "$addr_host" ]
 	then
-		echo "error: Invalid usage. Use: $0 add <user@host>" >&2
+		echo "error: Invalid usage. Use: $0 add [+w|-w] <user@host>" >&2
 		exit 1
 	fi
 	
@@ -166,7 +256,7 @@ then
 	then
 		mkdir -p "$contact_dir"
     else
-        if [ "$1" = "register" ] && ! [ -e "$__bs_home/store/$contact" ]
+        if [ "$set_store" = "add" ] && ! [ -e "$__bs_home/store/$contact" ]
         then
             if [ -e "$__bs_home/trash/store/$contact" ]
             then
@@ -176,13 +266,16 @@ then
             else
                 mkdir -p "$__bs_home/store/$contact"
             fi
+            
             echo "info: Existing contact successfully registered as user: $contact"
+            
             exit 0
-        elif [ "$1" = "deregister" ]
+            
+        elif [ "$set_store" = "del" ]
         then
             if [ -e "$__bs_home/store/$contact" ]
             then
-                if ! [ -e "$__bs_home" ]
+                if ! [ -e "$__bs_home/trash/store" ]
                 then
                     mkdir -p "$__bs_home/trash/store"
                 fi
@@ -191,16 +284,35 @@ then
                 
                 echo "info: Existing store directory put in trash: trash/store/$contact"
             fi
+            
             echo "info: Existing user successfully deregistered, is now a contact: $contact"
+            
             exit 0
-        else
-            echo "error: Contact already exists: $contact"
+        fi
+        
+        echo "warning: Contact already exists: $contact"
+        echo "Do you want to overwrite? (y/N) "
+        IFS= read -r ans
+        if [ "$ans" != "y" ]
+        then
             exit 1
         fi
 	fi
 	
-	# Write public-key to contact file
-	cat "${3:---}" > "$contact_dir/cert.pem"
+	if [ -z "$3" ]
+	then
+        if [ "$contact" = "$__bs_user@$__bs_host" ]
+        then
+            # This user IS the contact, so just copy the certificate that is already there
+            ln -s "$__bs_home/cert.pem" "$contact_dir/cert.pem"
+        else
+            # Fetch public key automatically from remote contact server
+            "$0" pull -c "$contact&cert.pem" >"$contact_dir/cert.pem"
+        fi
+	else
+        # Write public-key to contact file (either from file argument, or stdin)
+        cat "$@" > "$contact_dir/cert.pem"
+    fi
 	
 	# Write custom port to contact file
 	if [ -n "$addr_port" ]
@@ -242,16 +354,6 @@ then
         fi
 	done
 	
-	cleanup_array=()
-    cleanup()
-    {
-        for cmd in "${cleanup_array[@]}"
-        do
-            $cmd
-        done
-    }
-    trap 'cleanup' EXIT
-	
 	{ read -r target_addr_user; read -r target_addr_host; read -r target_addr_port; read -r target_addr_path; } < <(parse_address "$2")
 	{ read -r connect_addr_user; read -r connect_addr_host; read -r connect_addr_port; read -r connect_addr_path; } < <(parse_address "$3")
     
@@ -289,22 +391,22 @@ then
 	
 	# Build the header
 	header_file="$__bs_home/.tmp-header.$(date +'%s%N').txt"
-	cleanup_array+=("rm -f \"$header_file\"")
+	rm_onexit "$header_file"
 	cat <<EOF >"$header_file"
 bsp push $2
 from: $__bs_user@$__bs_host
-date: $(date --iso-8601)
+date: $(date --iso-8601=seconds)
 EOF
     
     if [ -n "$__bs_default_encryption_method" ]
     then
         # Generate a symmetric encryption key
         key_file="$__bs_home/.tmp-random.$(date +'%s%N').bin"
-        cleanup_array+=("rm -f \"$key_file\"")
+        rm_onexit "$key_file"
         openssl rand -base64 32 >"$key_file"
         
         # Encrypt the symmetric encryption key
-        cleanup_array+=("rm -f \"$key_file.enc\"")
+        rm_onexit "$key_file.enc"
         openssl rsautl -encrypt -certin -inkey "$__bs_home/contacts/$contact/cert.pem" -in "$key_file" -out "$key_file.enc"
         
         cat <<EOF >>"$header_file"
@@ -315,7 +417,7 @@ EOF
     
     # Create signature of header
     header_hash_file="$header_file.sha256"
-    cleanup_array+=("rm -f \"$header_hash_file\"")
+    rm_onexit "$header_hash_file"
     openssl dgst -binary -sha256 "$header_file" >"$header_hash_file"
 	
 	# Securely connect with the conn_host:conn_port
@@ -340,7 +442,6 @@ EOF
         # the limitation is that we cannot send less than 16 bytes at a time, which should not be an issue
         if [ "${__bs_default_encryption_method:0:8}" = "openssl " ]
         then
-            # stdbuf --output=L 
             if $is_line_buffered
             then
                 pipe_linebuffer "$blocksize" | stdbuf --output=0 openssl enc ${__bs_default_encryption_method:8} -bufsize 16 -kfile "$key_file"
@@ -352,28 +453,23 @@ EOF
         fi
         
         # -no_ign_eof -> close on end of stdin
-    } | openssl s_client -cert "$__bs_home/cert.pem" -key "$__bs_home/key.pem" -connect "$conn_host:$conn_port" -quiet -crlf -no_ign_eof 
+    } | openssl s_client -cert "$__bs_home/cert.pem" -key "$__bs_home/key.pem" -connect "$conn_host:$conn_port" -quiet -no_ign_eof 
 	
-	
-elif [ "$1" = "pull" ] # bs pull <path>
+elif [ "$1" = "pull" ] # bs pull [--close,-c] <path>
 then
-    
-    cleanup_array=()
-    cleanup()
-    {
-        for cmd in "${cleanup_array[@]}"
-        do
-            $cmd
-        done
-    }
-    trap 'cleanup' EXIT
-    
     # bs pull should retrieve a complete directory listing of non-empty files on the server
     # basically:
     #  - #channel1 -> store/user/#channel1/some-user@some-host
     #  - #channel2 -> store/user/#channel2/some-user@some-host
     #  - /any/path/to/anywhere -> store/user/some-user@some-host/any/path/to/anywhere
     #  - &cert.pem -> contacts/user/cert.pem
+    
+    autoclose=false
+    if [ "$2" == "--close" ] || [ "$2" == "-c" ]
+    then
+        autoclose=true
+        shift
+    fi
     
     conn_host="$(cat "$__bs_home/host")"
     conn_port="$__bs_default_secure_port"
@@ -382,7 +478,7 @@ then
         conn_port="$(cat "$__bs_home/port")"
     fi
     
-    echo "Connecting to $conn_host:$conn_port"
+    echo "[bs pull] Connecting to $conn_host:$conn_port" >&2
     
     conn_dir="$__bs_home/contacts/$conn_host"
     
@@ -394,22 +490,22 @@ then
     conn_cert="$conn_dir/cert.pem"
     if ! [ -e "$conn_cert" ]
     then
-        echo "Grabbing server public certificate"
+        echo "Grabbing server public certificate" >&2
         openssl s_client -servername "$conn_host" -showcerts "$conn_host:$conn_port" 2>/dev/null | openssl x509 >"$conn_cert"
     fi
     
 	# Build the header
 	header_file="$__bs_home/.tmp-header.$(date +'%s%N').txt"
-	cleanup_array+=("rm -f \"$header_file\"")
+	rm_onexit "$header_file"
 	cat <<EOF >"$header_file"
 bsp pull $2
 from: $__bs_user@$__bs_host
-date: $(date --iso-8601)
+date: $(date --iso-8601=seconds)
 EOF
     
     # Create signature of header
     header_hash_file="$header_file.sha256"
-    cleanup_array+=("rm -f \"$header_hash_file\"")
+    rm_onexit "$header_hash_file"
     openssl dgst -binary -sha256 "$header_file" >"$header_hash_file"
 	
 	# Securely connect with the conn_host:conn_port
@@ -428,10 +524,19 @@ EOF
         # Send blank line before data payload:
         echo ""
         
-        # No payload, we already sent the path we want to pull
+        # If we want to automatically exit after this request (no more requests are coming):
+        if $autoclose
+        then
+            echo "bsp exit"
+            echo ""
+        else
+            # how do we terminate cat directly after openssl is closed?
+            # now, cat is just waiting for input, until openssl closes
+            cat
+        fi
         
-    } | openssl s_client -cert "$__bs_home/cert.pem" -key "$__bs_home/key.pem" -CAfile "$conn_cert" -connect "$conn_host:$conn_port" -quiet -crlf | "$0" accept-local
-
+    } | openssl s_client -cert "$__bs_home/cert.pem" -key "$__bs_home/key.pem" -CAfile "$conn_cert" -connect "$conn_host:$conn_port" -quiet | "$0" accept-local
+    
 elif [ "$1" = "listen" ]
 then
     
@@ -464,29 +569,56 @@ then
     
     # careful, value proto cmd and value must have precisely 1 whitespace between them, and no trailing whitespaces must exist either (except for \r, which is fine)
     
-    cleanup_array=()
-    cleanup()
-    {
-        for cmd in "${cleanup_array[@]}"
-        do
-            $cmd
-        done
-    }
-    trap 'cleanup' EXIT
-    
     is_local=false
     if [ "$1" = "accept-local" ]
     then
         is_local=true
     fi
     
-    echo "debug: connection accepted ($1)"
+    if ! $is_local
+    then
+        echo "debug: Connection accepted $(date --iso-8601=seconds)" >&2
+    fi
+    
+    # if is_local, then any errors, warnings, or debug should go to >&2
+    # if not is_local, then everything must go to >&1
+    
+    parallel_process_pid=""
     
     while IFS=$'\r ' read -r proto cmd _value
     do
         value="${_value%$'\r'}"
         
-        # echo "debug: read $proto $cmd $value"
+        # echo "debug: New line: $proto $cmd $_value" >&2
+        
+        # skip empty lines
+        if [ -z "$proto" ]
+        then
+            continue
+        fi
+        
+        # a previous process is still running (i.e. pull: tail -f)
+        # since we are receiving a new request, we terminate it now
+        if [ -n "$parallel_process_pid" ]
+        then
+            echo "debug: Killing process: $parallel_process_pid" >&2
+
+            # wait at most 10 seconds until it is killed
+            timer=0
+            while kill "$parallel_process_pid" 2>/dev/null && kill -0 "$parallel_process_pid" 2>/dev/null && [ "$timer" -lt "100" ]
+            do
+                echo "debug: Waiting to kill process: $parallel_process_pid" >&2
+                sleep 0.1
+                timer=$((timer + 1))
+            done
+
+            echo "debug: Waiting for job to exit." >&2
+
+            # waits for any jobs if any job exists
+            wait
+
+            echo "debug: Process exited: $parallel_process_pid" >&2
+        fi
         
         if [ "$proto" = "bsp" ]
         then
@@ -494,10 +626,8 @@ then
             header_file="$__bs_home/.tmp-header.$(date +'%s%N').txt"
             header_file_crlf="$__bs_home/.tmp-header-crlf.$(date +'%s%N').txt"
             
-            cleanup_array+=("rm -f \"$header_file\"")
-            cleanup_array+=("rm -f \"$header_file_crlf\"")
-            
-            echo "debug: reading header..."
+            rm_onexit "$header_file"
+            rm_onexit "$header_file_crlf"
             
             echo "$proto $cmd $value" >"$header_file"
             echo "$proto $cmd $value"$'\r' >"$header_file_crlf"
@@ -515,12 +645,10 @@ then
                 echo "$line"$'\r' >>"$header_file_crlf"
             done
             
-            echo "debug: header read"
+            # echo "debug: Processing command: $cmd" >&2
             
             if [ "$cmd" = "signature" ]
             then
-                echo "debug: command signature ..."
-            
                 signature_header_file="$header_file"
                 signature="$value"
                 hash_fn="sha256"
@@ -529,11 +657,8 @@ then
                 do
                     if [ -z "$key" ]
                     then
-                        echo "debug: End of header"
                         break
                     fi
-                    
-                    echo "debug: Header entry found: $key = $value"
                     
                     if [ "$key" = "bsp" ]
                     then
@@ -548,31 +673,31 @@ then
                     
                     fi
                 done <"$header_file"
-                
-                echo "end of signature packet"
             
-            elif [ "$cmd" = "list" ]
+            elif [ "$cmd" = "quit" ] || [ "$cmd" = "exit" ]
             then
-                echo "STDERR:" >&2
+                exit 0
+                
+            elif $is_local && [ "$cmd" = "info" ]
+            then
+                # header has been consumed, info has no data block
+                
+                echo "-------- INFO ---------" >&2
                 cat "$header_file" >&2
+                echo "----- END OF INFO -----" >&2
                 echo "" >&2
                 
-                echo "STDOUT:"
+                continue
                 
-                cat
-            
-            elif [ "$cmd" = "push" ] || [ "$cmd" = "pull" ]
+            elif $is_local && ( [ "$cmd" = "list" ] || [ "$cmd" = "data" ] || [ "$cmd" = "file" ] )
             then
+                # data and list have both similar properties
+                # but in the absence of content-length, list will automatically terminate after an empty/blank line
+                # data is just binary data, list is line-by-line data
+                # after list, more commands may follow, but data without content-length means it's always the last command (before exit)
+                # list is also white-space trimmed
                 
-                echo "debug: command $cmd $value"
-                
-                # parse header:
-                
-                bsp_packet_recipient=""
-                bsp_packet_from=""
-                bsp_packet_date=""
-                bsp_packet_encryption_method=""
-                bsp_packet_encryption_key=""
+                content_length=""
                 
                 while IFS=$'\r :' read -r key value
                 do
@@ -583,8 +708,68 @@ then
                     
                     if [ "$key" = "bsp" ]
                     then
-                        # remove "push " prefix from value, so that is 5 chars
-                        bsp_packet_recipient="${value:5}"
+                        continue
+                    elif [ "$key" = "content-length" ]
+                    then
+                        content_length="$value"
+                    fi
+                done <"$header_file"
+                
+                #echo "--- HEADER: $cmd ---" >&2
+                #cat "$header_file" >&2
+                #echo "--- END OF HEADER ---" >&2
+                #echo "" >&2
+                
+                if [ "$cmd" = "data" ]
+                then
+                    # parse data packets
+                    continue
+                
+                elif [ "$cmd" = "list" ] || [ "$cmd" = "file" ]
+                then
+                    if [ -z "$content_length" ]
+                    then
+                        # no content length means everything that follows is part of the content
+                        while IFS=$'\r ' read -r line
+                        do
+                            if [ -z "$line" ]
+                            then
+                                break
+                            fi
+                            
+                            echo "$line"
+                        done
+                    else
+                        # print the content, and then continue
+                        head -c "$content_length"
+                    fi
+                fi
+                
+            elif $is_local && ( [ "$cmd" = "push" ] ) || ! $is_local && ( [ "$cmd" = "push" ] || [ "$cmd" = "pull" ] )
+            then
+                
+                # parse header:
+                
+                bsp_packet_recipient=""
+                bsp_packet_from=""
+                bsp_packet_date=""
+                bsp_packet_encryption_method=""
+                bsp_packet_encryption_key=""
+                bsp_packet_content_length=""
+                bsp_packet_content_encoding=""
+                
+                while IFS=$'\r :' read -r key value
+                do
+                    if [ -z "$key" ]
+                    then
+                        break
+                    fi
+                    
+                    if [ "$key" = "bsp" ]
+                    then
+                        # remove "push ", "pull " prefix from value, so that is 5 chars
+                        offset="$(( ${#cmd} + 1 ))"
+                        bsp_packet_recipient="${value:$offset}"
                     
                     elif [ "$key" = "to" ]
                     then
@@ -605,10 +790,20 @@ then
                     elif [ "$key" = "encryption-key" ]
                     then
                         bsp_packet_encryption_key="$value"
+                    
+                    elif [ "$key" = "content-length" ]
+                    then
+                        bsp_packet_content_length="$value"
                         
+                    elif [ "$key" = "content-encoding" ]
+                    then
+                        bsp_packet_content_encoding="$value"
+                    
                     else
                         # warning about header key not parsed due to not implemented
+                        echo "bsp info"
                         echo "warning: Header not implemented: $key"
+                        echo ""
                     fi
                     
                 done <"$header_file"
@@ -621,13 +816,17 @@ then
                 # check if we know this contact
                 if ! [ -e "$__bs_home/contacts/$contact" ]
                 then
+                    echo "bsp info"
                     echo "error: Unknown contact: $contact"
                     echo "hint: Don't worry, this is not your fault, stranger. You may try to register yourself here using: bs {add|register} <user@host> $__bs_host"
+                    echo ""
                     exit 1
                     
                 elif ! [ -e "$__bs_home/contacts/$contact/cert.pem" ]
                 then
+                    echo "bsp info"
                     echo "error: Certificate not found: $contact/cert.pem"
+                    echo ""
                     exit 1
                     
                     # this may be automatically resolved using: $0 pull "$contact$contact_port&cert.pem"
@@ -638,8 +837,6 @@ then
                 recipient_contact="$recipient_addr_user@$recipient_addr_host"
                 recipient_path="$recipient_addr_path"
                 
-                echo "debug: recipient: $recipient_addr_path"
-                
                 # but first we must check the signature
                 if [ -n "$signature" ]
                 then
@@ -647,18 +844,18 @@ then
                     header_hash_file="$header_file.hash"
                     header_hash_file_crlf="$header_file_crlf.hash"
                     
-                    echo "debug: checking signature"
-                    
                     if [ "$hash_fn" = "sha256" ] || [ "$hash_fn" = "SHA256" ] || [ "$hash_fn" = "SHA-256" ] || [ "$hash_fn" = "sha-256" ]
                     then
-                        cleanup_array+=("rm -f \"$header_hash_file\"")
+                        rm_onexit "$header_hash_file"
                         openssl dgst -binary -sha256 "$header_file" | base64 -w 0 >"$header_hash_file"
                         
-                        cleanup_array+=("rm -f \"$header_hash_file_crlf\"")
+                        rm_onexit "$header_hash_file_crlf"
                         openssl dgst -binary -sha256 "$header_file_crlf" | base64 -w 0 >"$header_hash_file_crlf"
                         
                     else
+                        echo "bsp info"
                         echo "error: Unsupported hash: $hash_fn"
+                        echo ""
                         exit 1
                     fi
                     
@@ -667,24 +864,24 @@ then
                     
                     if [ "$decrypted_hash" != "$(cat "$header_hash_file")" ] && [ "$decrypted_hash" != "$(cat "$header_hash_file_crlf")" ]
                     then
+                        echo "bsp info"
                         echo "error: Invalid signature."
                         echo "info: For hash: $(cat "$header_hash_file" | base64 -w 0)"
                         echo "info: For cert: $(cat "$__bs_home/contacts/$contact/cert.pem")"
+                        echo ""
                         exit 1
-                    else
-                        echo "debug: signature is ok"
                     fi
                     
                 elif [ "$cmd" = "push" ] || [ "${recipient_path:0:1}" != "&" ]
                 then
+                    echo "bsp info"
                     echo "error: Signature is mandatory for command: $cmd"
                     echo "hint: Create a hash (sha256) of the '$proto $cmd' header (excluding the blank line before the payload data)."
                     echo "hint: Calculate a signature of the hash using your private key."
                     echo "hint: Prepend a '$proto signature <signature>' header before the '$proto $cmd' header, with a blank line in between the two headers."
                     echo "hint: Provide the used hash function in the '$proto signature <signature>' header (e.g. hash: sha256)."
+                    echo ""
                     exit 1
-                else
-                    echo "debug: skipping signature, not required"
                 fi
                 
                 if $is_local
@@ -694,15 +891,26 @@ then
                     
                     if [ "$cmd" = "push" ]
                     then
-                        cat "$signature_header_file" >&2
-                        echo "" >&2
-                        cat "$header_file" >&2
-                        echo "" >&2
-                        
                         pipeline=""
                         
+                        if [ -n "$bsp_packet_content_encoding" ]
+                        then
+                            if [ "$bsp_packet_content_encoding" = "base64" ]
+                            then
+                                if [ -n "$pipeline" ]
+                                then
+                                    pipeline="$pipeline | "
+                                fi
+                                
+                                pipeline="${pipeline}base64 -d"
+                            else
+                                echo "error: Unsupported content encoding: $bsp_packet_content_encoding" >&2
+                                exit 1
+                            fi
+                        fi
+                        
                         key_file="$__bs_home/.tmp-encryption-key.$(date +'%s%N').bin"
-                        cleanup_array+=("rm -f \"$key_file\"")
+                        rm_onexit "$key_file"
                         if [ -n "$bsp_packet_encryption_key" ]
                         then
                             echo "$bsp_packet_encryption_key" | base64 -d | openssl rsautl -decrypt -inkey "$__bs_home/key.pem" >"$key_file"
@@ -719,7 +927,7 @@ then
                                 
                                 pipeline="${pipeline}stdbuf --output=0 openssl enc -d ${bsp_packet_encryption_method:8} -bufsize 16 -kfile \"$key_file\""
                             else
-                                echo "error: Unsupported encryption method: $bsp_packet_encryption_method"
+                                echo "error: Unsupported encryption method: $bsp_packet_encryption_method" >&2
                                 exit 1
                             fi
                         fi
@@ -734,16 +942,23 @@ then
                                 fi
                                 pipeline="${pipeline}gzip -d"
                             else
-                                echo "error: Unsupported compression method: $bsp_packet_compression_method"
+                                echo "error: Unsupported compression method: $bsp_packet_compression_method" >&2
                                 exit 1
                             fi
                         fi
                         
-                        # no decryption or filter needed
-                        cat | bash -c "$(echo "$pipeline")"
+                        # decryption pipeline etc
+                        if [ -z "$bsp_packet_content_length" ]
+                        then
+                            cat | bash -c "$(echo "$pipeline")"
+                        else
+                            head -c "$bsp_packet_content_length" | bash -c "$(echo "$pipeline")"
+                            
+                            # continue with next bsp packet, since content-length was given
+                        fi
                         
                     else
-                        echo "warning: Cannot handle command locally: $cmd" >&2
+                        echo "warning: Unsupported local command: $cmd" >&2
                     fi
                     
                 else
@@ -759,6 +974,7 @@ then
                             conn_port="${recipient_addr_port:-$__bs_default_secure_port}"
                             
                             # otherwise, we can relay the message to the correct host here
+                            echo "bsp info"
                             echo "info: Relaying from host: $__bs_host"
                             echo "info: Relaying to host: $conn_host:$conn_port"
                             echo "" # blank line to indicate next messages are from the relayed host
@@ -772,14 +988,18 @@ then
                         # check if recipient is a contact on the server
                         if ! [ -e "$recipient_contact_dir" ]
                         then
+                            echo "bsp info"
                             echo "error: Contact not found: $recipient_contact"
+                            echo ""
                             exit 1
                         fi
                         
                         # automatically create recipient store dir if never sent to this recipient before
                         if ! [ -e "$recipient_store_dir" ]
                         then
+                            echo "bsp info"
                             echo "error: Recipient does not have a storage directory ($recipient_contact)."
+                            echo ""
                             exit 1
                         fi
                         
@@ -791,8 +1011,9 @@ then
                         if [ "${recipient_path:0:1}" = "&" ]
                         then
                             # if &ref, then this is invalid, this is read-only without user in the path, /&ref
-                            
+                            echo "bsp info"
                             echo "error: Forbidden to write, path is read-only: $recipient_path"
+                            echo ""
                             exit 1
                             
                         elif [ "${recipient_path:0:1}" = "#" ]
@@ -808,7 +1029,9 @@ then
                             case "$(readlink -m "$recipient_store_file")" in
                                 "$recipient_store_dir/"*) ;;
                                 *)
+                                    echo "bsp info"
                                     echo "error: Forbidden path, out of jail: $recipient_path"
+                                    echo ""
                                     exit 1
                                 ;;
                             esac
@@ -822,7 +1045,9 @@ then
                             case "$(readlink -m "$recipient_store_file")" in
                                 "$recipient_store_dir/$recipient_contact/"*) ;;
                                 *)
+                                    echo "bsp info"
                                     echo "error: Forbidden path, out of jail: $recipient_path"
+                                    echo ""
                                     exit 1
                                 ;;
                             esac
@@ -831,12 +1056,14 @@ then
                         
                         if ! mkdir -p "$(readlink -m "$recipient_store_file/..")"
                         then
+                            echo "bsp info"
                             echo "error: Internal server error (mkdir)."
+                            echo ""
                             exit 1
                         fi
                         
                         tmp_store_file="$__bs_home/.tmp-store.$(date +'%s%N').bin"
-                        cleanup_array=("rm -f \"$tmp_store_file\"")
+                        rm_onexit "$tmp_store_file"
                         
                         # prepare headers in tmp file
                         cat "$signature_header_file" >"$tmp_store_file"
@@ -845,7 +1072,21 @@ then
                         echo "" >>"$tmp_store_file"
                         
                         # append headers and then stdin to file
-                        cat "$tmp_store_file" - >"$recipient_store_file"
+                        {
+                            cat "$tmp_store_file"
+                            
+                            if [ -z "$bsp_packet_content_length" ]
+                            then
+                                # read from stdin
+                                cat
+                            else
+                                # read only a specific number of bytes
+                                head -c "$bsp_packet_content_length"
+                            fi
+                        } >>"$recipient_store_file"
+                        
+                        echo "debug: Push completed, total bytes written: $(wc -c "$recipient_store_file")" >&2
+                        
                     
                     elif [ "$cmd" = "pull" ]
                     then
@@ -865,12 +1106,24 @@ then
                             # this is a public dir, anyone, without signature can request this
                             # this is how cert.pem is distributed, for instance
                             
-                            if [ "$recipient_path" = "cert.pem" ]
+                            if [ "$recipient_path" = "&cert.pem" ]
                             then
-                                cat "$__bs_home/contacts/$contact/cert.pem"
+                                cert_file="$__bs_home/contacts/$recipient_contact/cert.pem"
+                                read filesize filename < <(wc -c "$cert_file")
+                                echo "bsp file"
+                                echo "date: $(date --iso-8601=seconds)"
+                                echo "content-length: $filesize"
+                                echo ""
+                                cat "$cert_file"
                                 exit 0
+                            #elif [ -e "...$recipient_path" ] --> do security check, but never file listing possible
+                            #then
+                            #    cat "$__bs_home/contacts/$contact/public/$recipient_path"
+                            #    exit 0
                             else
+                                echo "bsp info"
                                 echo "info: Path not found: $recipient_path"
+                                echo ""
                                 exit 0
                             fi
                         
@@ -891,34 +1144,68 @@ then
                             "$contact_dir/"*) ;;
                             "$contact_dir"*) ;;
                             *)
+                                echo "bsp info"
                                 echo "error: Forbidden path, out of jail: $recipient_path"
+                                echo ""
                                 exit 1
                             ;;
                         esac
                         
                         contact_store_file="$(readlink -m "$contact_store_file")"
                         
-                        echo "debug: reading path: $contact_store_file"
-                        
-                        # send blank line before the actual data payload
-                        # this way we can send warning/error/info/debug messages before the payload, which should be skipped by the receiver
-                        echo ""
-                        
                         if [ -f "$contact_store_file" ]
                         then
                             # print file contents
-                            cat "$contact_store_file"
+                            # check if any pid is writing to the file: 
+                            
+                            status="offline"
+                            if [ "$(lsof "$contact_store_file" | awk 'BEGIN{w=0;} NR>1{if($4 ~ /w/){w+=1}} END{print w}')" -gt 0 ]
+                            then
+                                status="online"
+                            fi
+                            
+                            read filesize filename < <(wc -c "$contact_store_file")
+                            echo "bsp data $recipient_path"
+                            echo "date: $(date --iso-8601=seconds)"
+                            echo "minimum-content-length: $filesize"
+                            echo "last-modified-date: $(date --iso-8601=seconds -r "$contact_store_file")"
+                            echo "status: $status"
+                            echo ""
+                            head -c "$filesize" "$contact_store_file"
+                            tail -c +"$(($filesize + 1))" -f "$contact_store_file" &
+                            parallel_process_pid=$!
+                            # run in parallel, so that we may read a new line, and terminate it automatically when a new request comes in
+                            
+                            echo "debug: Started parallel process: $parallel_process_pid" >&2
+                            
                         else
                             # list directory (no particular order, 1 file per line, escape non-printable characters)
-                            echo "bsp list ${recipient_path:${#contact_dir}}"
+                            tmp_list_file="$__bs_home/.tmp-list_file.$(date +'%s%N').txt"
+                            rm_onexit "$tmp_list_file"
+                            
+                            touch "$tmp_list_file"
+                            ls -U -1 -b "$contact_store_file" > "$tmp_list_file" 2>/dev/null
+                            
+                            read filesize filename < <(wc -c "$tmp_list_file")
+                            
+                            echo "bsp list $recipient_path"
+                            echo "date: $(date --iso-8601=seconds)"
+                            echo "content-length: $filesize"
                             echo ""
-                            ls -U -1 -b "$contact_store_file"
+                            cat "$tmp_list_file"
+                            echo ""
                         fi
                         
                         # don't exit, to allow multiple requests in the same connection
-                        exit 0
                     else
-                        echo "info: Unknown command: $cmd"
+                        if $is_local
+                        then
+                            echo "info: Unknown command: $cmd" >&2
+                        else
+                            echo "bsp info"
+                            echo "info: Unknown command: $cmd"
+                            echo ""
+                        fi
                     fi
                 fi
                 
@@ -928,11 +1215,25 @@ then
                 hash_fn=""
                 
             else
-                echo "error: Unsupported command: $cmd"
+                if $is_local
+                then
+                    echo "error: Unsupported command: $cmd" >&2
+                else
+                    echo "bsp info"
+                    echo "error: Unsupported command: $cmd"
+                    echo ""
+                fi
                 exit 1
             fi
         else
-            echo "warning: Unsupported protocol: $proto"
+            if $is_local
+            then
+                echo "warning: Unsupported protocol: $proto" >&2
+            else
+                echo "bsp info"
+                echo "warning: Unsupported protocol: $proto"
+                echo ""
+            fi
             
             # wait until empty line, then we check protocol again
             while IFS=$'\r ' read -r _line
@@ -943,13 +1244,14 @@ then
                 then
                     break
                 fi
+                
+                # print lines from unknown protocol (by default we just output the data, it might be base64 encoded data)
+                echo "$line"
             done
             
             # check protocol again in next round
         fi
     done
-    
-    echo "debug: connection ended"
     
 fi
 
@@ -958,42 +1260,39 @@ fi
 ### TUTORIAL:
 exit 0
 
-
-# clean up:
-
-rm -Rf /tmp/test*
-
-
+# start with a clean slate:
+rm -rf /tmp/bs-alice /tmp/bs-bob
 
 # init certs and user dirs:
-
-BS_HOME=/tmp/test-bs-alice ./bs.sh push bob@bs.net
-BS_HOME=/tmp/test-bs-bob ./bs.sh push alice@bs.net
+BS_HOME=/tmp/bs-alice ./bs.sh
+BS_HOME=/tmp/bs-bob ./bs.sh
 
 
 # set correct host:
-
-echo "bs.net" >/tmp/test-bs-alice/host
-echo "bs.net" >/tmp/test-bs-bob/host
+echo "bs.net" >/tmp/bs-alice/host
+echo "bs.net" >/tmp/bs-bob/host
 
 # set correct user:
-
-echo "alice" >/tmp/test-bs-alice/user
-echo "bob" >/tmp/test-bs-bob/user
+echo "alice" >/tmp/bs-alice/user
+echo "bob" >/tmp/bs-bob/user
 
 # add self as contact and user
+BS_HOME=/tmp/bs-alice ./bs.sh register alice@bs.net
+BS_HOME=/tmp/bs-bob ./bs.sh register bob@bs.net
 
-BS_HOME=/tmp/test-bs-alice ./bs.sh register alice@bs.net /tmp/test-bs-alice/cert.pem
-BS_HOME=/tmp/test-bs-bob ./bs.sh register bob@bs.net /tmp/test-bs-bob/cert.pem
+# add each other as contacts (certificate is optional if listen is running for each contact)
+BS_HOME=/tmp/bs-alice ./bs.sh add bob@bs.net /tmp/bs-bob/cert.pem
+BS_HOME=/tmp/bs-bob ./bs.sh add alice@bs.net /tmp/bs-alice/cert.pem
 
-# add each other as contacts
+# then in parallel, let bob listen, and let alice say hello to bob:
+BS_HOME=/tmp/bs-bob ./bs.sh listen
 
-BS_HOME=/tmp/test-bs-alice ./bs.sh add bob@bs.net /tmp/test-bs-bob/cert.pem
-BS_HOME=/tmp/test-bs-bob ./bs.sh add alice@bs.net /tmp/test-bs-alice/cert.pem
+# then in parallel, send a message to bob
+cat | BS_HOME=/tmp/bs-alice ./bs.sh push bob@bs.net
 
-
-
-# to deal with aes-256-cbc plain text messages, we need to ensure every line to match 16 byte buffer length (for the block size of AES-256 bits = 32 bytes)
-
-while IFS= read -r line;do len="${#line}"; len="$(( (16 - (len + 1) % 16) % 16 ))"; echo "$line"; printf "%${len}s" | tr ' ' '\0'; done
+# then in parallel, listen to the message from alice in realtime
+# but first we need to find the message:
+BS_HOME=/tmp/bs-bob ./bs.sh pull --close :#hello
+#hello/alice@bs.net.123456790
+BS_HOME=/tmp/bs-bob ./bs.sh pull :#hello/alice@bs.net.123456790
 
